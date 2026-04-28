@@ -12,7 +12,6 @@ Problem(s) this probably won't fix by moving to GO:
 - Skeleton PoC
 - Working Sigma / Wazuh data structures and config moved to Yaml implemented
 - Reads in all Sigma rules
-- Creates skeleton Wazuh rules (no logic conversion)
 
 ## Configuration
 ```
