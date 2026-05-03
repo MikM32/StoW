@@ -18,6 +18,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config holds all runtime configuration and state for a conversion run.
+// Compared to stow.go, the key differences are:
+//   - Wazuh.RulesDir replaces Wazuh.RulesFile: output is a directory, not a single file.
+//   - Wazuh.WriteRules and Wazuh.XmlRules are removed; each input file writes its own XML.
+//   - TrackSkips.WazuhRulesCreated tracks the total across all output files.
+//
+// config.yaml must contain "RulesDir" under the Wazuh section, e.g.:
+//
+//	Wazuh:
+//	  RulesDir: ./sigma_rules_xml
 type Config struct {
 	Info  bool `yaml:"Info"`
 	Debug bool `yaml:"Debug"`
@@ -35,10 +45,9 @@ type Config struct {
 		SkipServices      []string `yaml:"SkipServices"`
 	} `yaml:"Sigma"`
 	Wazuh struct {
-		RulesFile   string `yaml:"RulesFile"`
+		RulesDir    string `yaml:"RulesDir"`
 		RuleIdFile  string `yaml:"RuleIdFile"`
 		RuleIdStart int    `yaml:"RuleIdStart"`
-		WriteRules  os.File
 		Levels      struct {
 			Informational int `yaml:"informational"`
 			Low           int `yaml:"low"`
@@ -59,10 +68,7 @@ type Config struct {
 			ProductServiceToWazuhId    map[string]string `yaml:"ProductServiceToWazuhId"`
 		} `yaml:"SidGrpMaps"`
 		FieldMaps map[string]map[string]string `yaml:"FieldMaps"`
-		XmlRules  WazuhGroup
 	} `yaml:"Wazuh"`
-	// OR logic can force the creation of multiple Wazuh rules
-	// Because of this we need to track Sigma to Wazuh rule ids between runs
 	Ids struct {
 		PreviousUsed []int            `yaml:"PreviousUsed"`
 		CurrentUsed  []int            `yaml:"CurrentUsed"`
@@ -77,6 +83,7 @@ type Config struct {
 		HardSkipped       int
 		RulesSkipped      int
 		ErrorCount        int
+		WazuhRulesCreated int
 	}
 }
 
@@ -96,7 +103,6 @@ func initPreviousUsed(c *Config) {
 }
 
 func LoadStowConfig(c *Config) {
-	// Load Sigma and Wazuh config for rule processing
 	data, err := os.ReadFile("./config.yaml")
 	if err != nil {
 		LogIt(ERROR, "", err, c.Info, c.Debug)
@@ -106,7 +112,6 @@ func LoadStowConfig(c *Config) {
 		LogIt(ERROR, "", err, c.Info, c.Debug)
 	}
 
-	// Lowercase the FieldMaps keys for case-insensitive matching
 	lowerFieldMaps := make(map[string]map[string]string)
 	for product, fields := range c.Wazuh.FieldMaps {
 		lowerFieldMaps[strings.ToLower(product)] = fields
@@ -115,7 +120,6 @@ func LoadStowConfig(c *Config) {
 }
 
 func LoadSigmaWazuhIdMap(c *Config) {
-	// Load Sigma ID to Wazuh ID mappings
 	data, err := os.ReadFile(c.Wazuh.RuleIdFile)
 	if err != nil {
 		LogIt(WARN, "Could not read rule_id_file, creating a new one", err, c.Info, c.Debug)
@@ -147,7 +151,6 @@ func InitConfig() *Config {
 
 	LoadStowConfig(c)
 	LoadSigmaWazuhIdMap(c)
-
 	initPreviousUsed(c)
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
 
@@ -174,7 +177,6 @@ type SigmaRule struct {
 	Level          string   `yaml:"level"`
 }
 
-// outer rules xml
 type WazuhGroup struct {
 	XMLName xml.Name    `xml:"group"`
 	Name    string      `xml:"name,attr"`
@@ -189,7 +191,6 @@ type Field struct {
 	Value  string `xml:",chardata"`
 }
 
-// per rule xml
 type WazuhRule struct {
 	XMLName xml.Name `xml:"rule"`
 	ID      string   `xml:"id,attr"`
@@ -266,18 +267,15 @@ func HandleWindash(value any) any {
 
 func AddToMapStrToInts(c *Config, sigmaId string, wazuhId int) {
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
-	// If the key doesn't exist, add it to the map with a new slice
 	if _, ok := c.Ids.SigmaToWazuh[sigmaId]; !ok {
 		c.Ids.SigmaToWazuh[sigmaId] = []int{wazuhId}
 		return
 	}
-	// If the key exists, append to the slice
 	c.Ids.SigmaToWazuh[sigmaId] = append(c.Ids.SigmaToWazuh[sigmaId], wazuhId)
 }
 
 func TrackIdMaps(sigmaId string, c *Config) string {
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
-	// has this Sigma rule been converted previously, reuse its Wazuh rule IDs
 	if ids, ok := c.Ids.SigmaToWazuh[sigmaId]; ok {
 		for _, id := range ids {
 			if !slices.Contains(c.Ids.CurrentUsed, id) {
@@ -286,7 +284,6 @@ func TrackIdMaps(sigmaId string, c *Config) string {
 			}
 		}
 	}
-	// new Sigma rule, find an unused Wazuh rule ID
 	for slices.Contains(c.Ids.PreviousUsed, c.Wazuh.RuleIdStart) ||
 		slices.Contains(c.Ids.CurrentUsed, c.Wazuh.RuleIdStart) {
 		c.Wazuh.RuleIdStart++
@@ -316,7 +313,6 @@ func GetLevel(sigmaLevel string, c *Config) int {
 
 func GetIfGrpSid(sigma *SigmaRule, c *Config) (string, string) {
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
-	// Get Wazuh if_group or if_sids dependencies for converted rules
 	switch {
 	case c.Wazuh.SidGrpMaps.SigmaIdToWazuhGroup[sigma.ID] != "":
 		return "grp", c.Wazuh.SidGrpMaps.SigmaIdToWazuhGroup[sigma.ID]
@@ -355,7 +351,6 @@ func GetOptions(sigma *SigmaRule, c *Config) []string {
 	var options []string
 	if c.Wazuh.Options.NoFullLog {
 		options = append(options, "no_full_log")
-
 	}
 	if c.Wazuh.Options.EmailAlert &&
 		(slices.Contains(c.Wazuh.Options.SigmaIdEmail, sigma.ID) ||
@@ -368,9 +363,8 @@ func GetOptions(sigma *SigmaRule, c *Config) []string {
 func GetWazuhField(fieldName string, sigma *SigmaRule, c *Config) string {
 	if f, ok := c.Wazuh.FieldMaps[strings.ToLower(sigma.LogSource.Product)][fieldName]; ok {
 		return f
-	} else {
-		return "full_log"
 	}
+	return "full_log"
 }
 
 func GetFieldValues(value any, fieldName string, c *Config) []string {
@@ -394,17 +388,14 @@ func GetFieldValues(value any, fieldName string, c *Config) []string {
 	default:
 		LogIt(DEBUG, fmt.Sprintf("Unsupported value type for field '%s': %T", fieldName, v), nil, c.Info, c.Debug)
 	}
-
 	if len(values) == 0 {
 		LogIt(DEBUG, fmt.Sprintf("No values extracted for field '%s'", fieldName), nil, c.Info, c.Debug)
 	}
 	return values
 }
 
-// processDetectionField extracts and processes a single field from a Sigma detection.
 func processDetectionField(selectionKey string, key string, value any, sigma *SigmaRule, c *Config, fields *[]Field, selectionNegations map[string]bool) {
 	LogIt(INFO, fmt.Sprintf("processDetectionField key: %s, value: %v", key, value), nil, c.Info, c.Debug)
-	// Handle modifiers in the key
 	parts := strings.Split(key, "|")
 	fieldName := parts[0]
 
@@ -415,7 +406,6 @@ func processDetectionField(selectionKey string, key string, value any, sigma *Si
 		Type: "pcre2",
 	}
 
-	// Apply negation if this selectionKey is marked as negated
 	if selectionNegations[selectionKey] {
 		field.Negate = "yes"
 	}
@@ -430,13 +420,13 @@ func processDetectionField(selectionKey string, key string, value any, sigma *Si
 		for _, modifier := range parts[1:] {
 			switch strings.ToLower(modifier) {
 			case "contains":
-				// Default behavior, no special handling needed
+				// default behaviour
 			case "startswith":
 				startsWith = true
 			case "endswith":
 				endsWith = true
 			case "all":
-				// Will be handled later
+				// handled below
 			case "re":
 				isRegex = true
 			case "base64offset":
@@ -472,10 +462,10 @@ func processDetectionField(selectionKey string, key string, value any, sigma *Si
 			} else {
 				newField.Value = "(?i)" + regexp.QuoteMeta(v)
 			}
-			*fields = append(*fields, newField) // Append to the passed slice pointer
+			*fields = append(*fields, newField)
 			LogIt(INFO, fmt.Sprintf("processDetectionField appended field: %v", newField), nil, c.Info, c.Debug)
 		}
-		return // Return from helper function
+		return
 	}
 
 	for _, v := range values {
@@ -508,7 +498,7 @@ func processDetectionField(selectionKey string, key string, value any, sigma *Si
 			}
 			field.Value = "(?i)" + value
 		}
-		*fields = append(*fields, field) // Append to the passed slice pointer
+		*fields = append(*fields, field)
 		LogIt(INFO, fmt.Sprintf("processDetectionField appended field: %v", field), nil, c.Info, c.Debug)
 	}
 }
@@ -522,7 +512,6 @@ func GetFields(detection map[string]any, sigma *SigmaRule, c *Config, selectionN
 				processDetectionField(selectionKey, key, value, sigma, c, &fields, selectionNegations)
 			}
 		} else if selectionList, ok := selectionVal.([]any); ok {
-			// Handle list of strings
 			var stringList []string
 			for _, item := range selectionList {
 				if str, ok := item.(string); ok {
@@ -533,7 +522,6 @@ func GetFields(detection map[string]any, sigma *SigmaRule, c *Config, selectionN
 				processDetectionField(selectionKey, "", stringList, sigma, c, &fields, selectionNegations)
 				continue
 			}
-
 			for _, item := range selectionList {
 				if itemMap, ok := item.(map[string]any); ok {
 					for key, value := range itemMap {
@@ -564,7 +552,6 @@ func BuildRule(sigma *SigmaRule, url string, c *Config, detections map[string]an
 	rule.Description = sigma.Title
 	rule.Info.Type = "link"
 	rule.Info.Value = url
-	// sometimes we see "--" in sigma fields which will break xml when in comments
 	rule.Author = xml.Comment("     Author: " + strings.Replace(sigma.Author, "--", "-", -1))
 	rule.SigmaDescription = xml.Comment("Description: " + strings.Replace(sigma.Description, "--", "-", -1))
 	rule.Date = xml.Comment("    Created: " + strings.Replace(sigma.Date, "--", "-", -1))
@@ -580,7 +567,6 @@ func BuildRule(sigma *SigmaRule, url string, c *Config, detections map[string]an
 	} else {
 		rule.IfSid = value
 	}
-
 	rule.Fields = fields
 
 	return rule
@@ -589,7 +575,6 @@ func BuildRule(sigma *SigmaRule, url string, c *Config, detections map[string]an
 func SkipSigmaRule(sigma *SigmaRule, c *Config) bool {
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
 
-	// Check if rule is explicitly skipped
 	if slices.Contains(c.Sigma.SkipIds, strings.ToLower(sigma.ID)) {
 		LogIt(INFO, "Skip Sigma rule ID: "+sigma.ID, nil, c.Info, c.Debug)
 		c.TrackSkips.HardSkipped++
@@ -597,7 +582,6 @@ func SkipSigmaRule(sigma *SigmaRule, c *Config) bool {
 		return true
 	}
 
-	// Check rule status
 	lowerRuleStatus := make([]string, len(c.Sigma.RuleStatus))
 	for i, s := range c.Sigma.RuleStatus {
 		lowerRuleStatus[i] = strings.ToLower(s)
@@ -609,17 +593,14 @@ func SkipSigmaRule(sigma *SigmaRule, c *Config) bool {
 		return true
 	}
 
-	// If ConvertAll is true, convert all rules that are not explicitly skipped
 	if c.Sigma.ConvertAll {
 		return false
 	}
 
-	// If no specific conversion criteria are set, convert all rules
 	if len(c.Sigma.ConvertCategories) == 0 && len(c.Sigma.ConvertServices) == 0 && len(c.Sigma.ConvertProducts) == 0 {
 		return false
 	}
 
-	// Check if the rule matches any of the conversion criteria
 	if slices.Contains(c.Sigma.ConvertCategories, strings.ToLower(sigma.LogSource.Category)) {
 		return false
 	}
@@ -630,7 +611,6 @@ func SkipSigmaRule(sigma *SigmaRule, c *Config) bool {
 		return false
 	}
 
-	// If we are here, it means the rule does not match any of the conversion criteria
 	LogIt(INFO, "Skip Sigma rule default: "+sigma.ID, nil, c.Info, c.Debug)
 	c.TrackSkips.RulesSkipped++
 	return true
@@ -691,7 +671,6 @@ func parse(tokens []Token) [][]string {
 		return [][]string{{""}}
 	}
 
-	// Infix to postfix conversion
 	var postfix []Token
 	var stack []Token
 	precedence := map[string]int{"or": 1, "and": 2, "not": 3}
@@ -707,8 +686,8 @@ func parse(tokens []Token) [][]string {
 				postfix = append(postfix, stack[len(stack)-1])
 				stack = stack[:len(stack)-1]
 			}
-			stack = stack[:len(stack)-1] // Pop LPAREN
-		default: // Operator
+			stack = stack[:len(stack)-1]
+		default:
 			for len(stack) > 0 && stack[len(stack)-1].Type != "LPAREN" && precedence[token.Value] <= precedence[stack[len(stack)-1].Value] {
 				postfix = append(postfix, stack[len(stack)-1])
 				stack = stack[:len(stack)-1]
@@ -722,7 +701,6 @@ func parse(tokens []Token) [][]string {
 		stack = stack[:len(stack)-1]
 	}
 
-	// Evaluate postfix expression
 	var evalStack [][][]string
 	for _, token := range postfix {
 		switch token.Type {
@@ -776,7 +754,6 @@ func parse(tokens []Token) [][]string {
 	return evalStack[0]
 }
 
-// Create tokens out of Sigma condition for better logic parsing
 func fixupCondition(condition string) string {
 	condition = strings.Replace(condition, "1 of them", "1_of them", -1)
 	condition = strings.Replace(condition, "all of them", "all_of them", -1)
@@ -794,7 +771,6 @@ func convertToDNF(expr string) [][]string {
 
 func PreprocessCondition(condition string, detections map[string]any, c *Config) string {
 	LogIt(INFO, fmt.Sprintf("Original condition: %s", condition), nil, c.Info, c.Debug)
-	// Pre-process condition to expand '1_of' and 'all_of'
 	re := regexp.MustCompile(`(not\s+)?(1_of|all_of)\s+(them|[a-zA-Z0-9_\*]+)`)
 	matches := re.FindAllStringSubmatch(condition, -1)
 
@@ -841,7 +817,7 @@ func PreprocessCondition(condition string, detections map[string]any, c *Config)
 				} else {
 					replacement = " ( " + strings.Join(matchingSelections, " or ") + " ) "
 				}
-			} else { // all_of
+			} else {
 				if isNot {
 					var negatedSelections []string
 					for _, s := range matchingSelections {
@@ -858,13 +834,13 @@ func PreprocessCondition(condition string, detections map[string]any, c *Config)
 			var replacement string
 			if directive == "1_of" {
 				if isNot {
-					replacement = "__TRUE__" // not (FALSE) is TRUE
+					replacement = "__TRUE__"
 				} else {
 					replacement = "__FALSE__"
 				}
-			} else { // all_of
+			} else {
 				if isNot {
-					replacement = "__FALSE__" // not (TRUE) is FALSE
+					replacement = "__FALSE__"
 				} else {
 					replacement = "__TRUE__"
 				}
@@ -876,8 +852,10 @@ func PreprocessCondition(condition string, detections map[string]any, c *Config)
 	return condition
 }
 
-func ProcessDnfSets(passingSets [][]string, detections map[string]any, sigmaRule *SigmaRule, url string, c *Config) {
-	for _, set := range passingSets { // Each 'set' is an AND group of selection names
+// ProcessDnfSets builds Wazuh rules from DNF groups and appends them to group.
+// Each AND group from the DNF becomes one or more WazuhRule entries in group.Rules.
+func ProcessDnfSets(passingSets [][]string, detections map[string]any, sigmaRule *SigmaRule, url string, c *Config, group *WazuhGroup) {
+	for _, set := range passingSets {
 		isFalse := false
 		var newSet []string
 		for _, item := range set {
@@ -891,13 +869,9 @@ func ProcessDnfSets(passingSets [][]string, detections map[string]any, sigmaRule
 		}
 
 		if isFalse {
-			continue // This whole AND group is false
+			continue
 		}
 
-		// Each 'set' from the DNF represents a potential Wazuh rule (a conjunction of conditions).
-		// However, a selection within that set can be a list of maps, which is an OR that requires
-		// expanding into multiple rules.
-		// detectionSets will hold all the possible detection maps after expanding any lists of maps.
 		detectionSets := []map[string]any{{}}
 		selectionNegations := make(map[string]bool)
 
@@ -912,17 +886,12 @@ func ProcessDnfSets(passingSets [][]string, detections map[string]any, sigmaRule
 			if val, isList := detections[item].([]any); isList {
 				isListOfMaps := false
 				if len(val) > 0 {
-					// Check if the first element is a map to determine the type of list
 					if _, ok := val[0].(map[string]any); ok {
 						isListOfMaps = true
 					}
 				}
 
 				if isListOfMaps {
-					// This selection is a list of maps. This is an OR condition between the map items.
-					// We need to create a new Wazuh rule for each map in the list.
-					// We do this by creating a cartesian product of the existing detectionSets
-					// and the new list of maps.
 					var newDetectionSets []map[string]any
 					for _, dSet := range detectionSets {
 						for _, listItem := range val {
@@ -936,14 +905,11 @@ func ProcessDnfSets(passingSets [][]string, detections map[string]any, sigmaRule
 					}
 					detectionSets = newDetectionSets
 				} else {
-					// This is a list of values (strings/ints). Treat it as a single selection
-					// that will be handled by processDetectionField to create a regex OR.
 					for _, dSet := range detectionSets {
 						dSet[item] = detections[item]
 					}
 				}
 			} else {
-				// This is a single selection, not a list. Add it to all detection sets.
 				for _, dSet := range detectionSets {
 					dSet[item] = detections[item]
 				}
@@ -953,12 +919,56 @@ func ProcessDnfSets(passingSets [][]string, detections map[string]any, sigmaRule
 		for _, detection := range detectionSets {
 			rule := BuildRule(sigmaRule, url, c, detection, selectionNegations)
 			if rule.ID != "" {
-				c.Wazuh.XmlRules.Rules = append(c.Wazuh.XmlRules.Rules, rule)
+				group.Rules = append(group.Rules, rule)
 			}
 		}
 	}
 }
 
+// outputPath derives the XML output path for a given Sigma YAML input path,
+// preserving the directory structure relative to RulesRoot inside RulesDir.
+// Example: <RulesRoot>/windows/proc_create_win_foo.yml
+//
+//	→ <RulesDir>/windows/proc_create_win_foo.xml
+func outputPath(inputPath string, c *Config) string {
+	relPath, err := filepath.Rel(c.Sigma.RulesRoot, inputPath)
+	if err != nil {
+		relPath = filepath.Base(inputPath)
+	}
+	noExt := strings.TrimSuffix(relPath, filepath.Ext(relPath))
+	return filepath.Join(c.Wazuh.RulesDir, noExt+".xml")
+}
+
+// writeRuleFile serialises group to an XML file at path, creating parent
+// directories as needed. Returns false on error.
+func writeRuleFile(group WazuhGroup, path string, c *Config) bool {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		LogIt(ERROR, "Could not create output directory for "+path, err, c.Info, c.Debug)
+		return false
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		LogIt(ERROR, "Could not create output file "+path, err, c.Info, c.Debug)
+		return false
+	}
+	defer file.Close()
+
+	enc := xml.NewEncoder(file)
+	enc.Indent("", "  ")
+	if err := enc.Encode(group); err != nil {
+		LogIt(ERROR, "Could not encode XML for "+path, err, c.Info, c.Debug)
+		return false
+	}
+	if _, err := file.WriteString("\n"); err != nil {
+		LogIt(ERROR, "Could not write trailing newline for "+path, err, c.Info, c.Debug)
+		return false
+	}
+	return true
+}
+
+// ReadYamlFile reads one Sigma rule file, converts it, and writes a matching
+// XML file to <RulesDir>. If the rule produces no Wazuh rules the output file
+// is not created (keeping the output directory clean).
 func ReadYamlFile(path string, c *Config) {
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
 	data, err := os.ReadFile(path)
@@ -967,17 +977,9 @@ func ReadYamlFile(path string, c *Config) {
 		return
 	}
 	LogIt(INFO, path, nil, c.Info, c.Debug)
-	relPath, err := filepath.Rel(c.Sigma.RulesRoot, path)
-	if err != nil {
-		LogIt(ERROR, "", err, c.Info, c.Debug)
-		relPath = path
-	}
-	url := c.Sigma.BaseUrl + "/" + filepath.ToSlash(relPath)
 
 	var sigmaRule SigmaRule
-
-	err = yaml.Unmarshal(data, &sigmaRule)
-	if err != nil {
+	if err := yaml.Unmarshal(data, &sigmaRule); err != nil {
 		LogIt(ERROR, "", err, c.Info, c.Debug)
 		return
 	}
@@ -1009,27 +1011,39 @@ func ReadYamlFile(path string, c *Config) {
 		return
 	}
 	condition = fixupCondition(condition)
-
 	condition = PreprocessCondition(condition, detections, c)
 
 	passingSets := convertToDNF(condition)
 
-	ProcessDnfSets(passingSets, detections, &sigmaRule, url, c)
+	// Build rules into a per-file group instead of a global accumulator.
+	var group WazuhGroup
+	ProcessDnfSets(passingSets, detections, &sigmaRule, buildURL(path, c), c, &group)
+
+	if len(group.Rules) == 0 {
+		return
+	}
+
+	group.Name = "sigma,"
+	group.Header = xml.Comment(`
+	Author: Brian Kellogg
+	Sigma: https://github.com/SigmaHQ/sigma
+	Wazuh: https://wazuh.com
+	All Sigma rules licensed under DRL: https://github.com/SigmaHQ/Detection-Rule-License `)
+
+	out := outputPath(path, c)
+	if writeRuleFile(group, out, c) {
+		c.TrackSkips.WazuhRulesCreated += len(group.Rules)
+		LogIt(INFO, fmt.Sprintf("Wrote %d rule(s) to %s", len(group.Rules), out), nil, c.Info, c.Debug)
+	}
 }
 
-func WriteWazuhXmlRules(c *Config) {
-	LogIt(DEBUG, "", nil, c.Info, c.Debug)
-	// Create an XML encoder that writes to the file
-	enc := xml.NewEncoder(&c.Wazuh.WriteRules)
-	enc.Indent("", "  ")
-
-	// Encode the rule struct to XML
-	if err := enc.Encode(c.Wazuh.XmlRules); err != nil {
-		LogIt(ERROR, "", err, c.Info, c.Debug)
+// buildURL constructs the Sigma GitHub URL for a given local file path.
+func buildURL(path string, c *Config) string {
+	relPath, err := filepath.Rel(c.Sigma.RulesRoot, path)
+	if err != nil {
+		relPath = path
 	}
-	if _, err := c.Wazuh.WriteRules.WriteString("\n"); err != nil {
-		LogIt(ERROR, "", err, c.Info, c.Debug)
-	}
+	return c.Sigma.BaseUrl + "/" + filepath.ToSlash(relPath)
 }
 
 func WalkSigmaRules(c *Config) []string {
@@ -1042,8 +1056,7 @@ func WalkSigmaRules(c *Config) []string {
 				return nil
 			}
 			var sigmaRule SigmaRule
-			err = yaml.Unmarshal(data, &sigmaRule)
-			if err != nil {
+			if err := yaml.Unmarshal(data, &sigmaRule); err != nil {
 				LogIt(ERROR, "", err, c.Info, c.Debug)
 				c.TrackSkips.ErrorCount++
 				return nil
@@ -1067,7 +1080,6 @@ func PrintStats(c *Config, sigmaRuleIds []string) {
 	fmt.Printf("\n\n***************************************************************************\n")
 	fmt.Printf(" Number of Sigma Experimental rules skipped: %d\n", c.TrackSkips.ExperimentalSkips)
 	fmt.Printf("    Number of Sigma TIMEFRAME rules skipped: %d\n", c.TrackSkips.TimeframeSkips)
-
 	fmt.Printf("        Number of Sigma PAREN rules skipped: %d\n", c.TrackSkips.ParenSkips)
 	fmt.Printf("         Number of Sigma CIDR rules skipped: %d\n", c.TrackSkips.Cidr)
 	fmt.Printf("         Number of Sigma NEAR rules skipped: %d\n", c.TrackSkips.NearSkips)
@@ -1077,7 +1089,7 @@ func PrintStats(c *Config, sigmaRuleIds []string) {
 	fmt.Printf("                  Total Sigma rules skipped: %d\n", c.TrackSkips.RulesSkipped)
 	fmt.Printf("                Total Sigma rules converted: %d\n", convertedSigmaRules)
 	fmt.Printf("---------------------------------------------------------------------------\n")
-	fmt.Printf("                  Total Wazuh rules created: %d\n", len(c.Wazuh.XmlRules.Rules))
+	fmt.Printf("                  Total Wazuh rules created: %d\n", c.TrackSkips.WazuhRulesCreated)
 	fmt.Printf("---------------------------------------------------------------------------\n")
 	fmt.Printf("                          Total Sigma rules: %d\n", len(sigmaRuleIds))
 	if len(sigmaRuleIds) > 0 {
@@ -1091,49 +1103,40 @@ func main() {
 	c.Info, c.Debug = getArgs(os.Args, c)
 	LogIt(DEBUG, "", nil, c.Info, c.Debug)
 
-	// Convert rules
-	file, err := os.Create(c.Wazuh.RulesFile)
-	if err != nil {
-		LogIt(ERROR, "", err, c.Info, c.Debug)
-		return
+	if c.Wazuh.RulesDir == "" {
+		c.Wazuh.RulesDir = "./sigma_rules_xml"
+		LogIt(WARN, "RulesDir not set in config.yaml, defaulting to "+c.Wazuh.RulesDir, nil, c.Info, c.Debug)
 	}
-	c.Wazuh.WriteRules = *file
-	defer file.Close()
 
-	// Check if Sigma rules directory is valid
+	// Validate Sigma rules directory.
 	sigmaRulesPathInfo, err := os.Stat(c.Sigma.RulesRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
-			LogIt(ERROR, fmt.Sprintf("Sigma rules directory '%s' not found. Please check the 'RulesRoot' path in your config.yaml.", c.Sigma.RulesRoot), err, c.Info, c.Debug)
+			LogIt(ERROR, fmt.Sprintf("Sigma rules directory '%s' not found. Please check 'RulesRoot' in config.yaml.", c.Sigma.RulesRoot), err, c.Info, c.Debug)
 		} else {
-			LogIt(ERROR, fmt.Sprintf("Error accessing Sigma rules directory '%s'. Please check the 'RulesRoot' path in your config.yaml.", c.Sigma.RulesRoot), err, c.Info, c.Debug)
+			LogIt(ERROR, fmt.Sprintf("Error accessing Sigma rules directory '%s'.", c.Sigma.RulesRoot), err, c.Info, c.Debug)
 		}
 		return
 	}
 	if !sigmaRulesPathInfo.IsDir() {
-		LogIt(ERROR, fmt.Sprintf("The configured Sigma rules path '%s' is not a directory. Please check the 'RulesRoot' path in your config.yaml.", c.Sigma.RulesRoot), nil, c.Info, c.Debug)
+		LogIt(ERROR, fmt.Sprintf("'%s' is not a directory. Please check 'RulesRoot' in config.yaml.", c.Sigma.RulesRoot), nil, c.Info, c.Debug)
+		return
+	}
+
+	// Ensure the output directory exists.
+	if err := os.MkdirAll(c.Wazuh.RulesDir, 0755); err != nil {
+		LogIt(ERROR, "Could not create RulesDir: "+c.Wazuh.RulesDir, err, c.Info, c.Debug)
 		return
 	}
 
 	sigmaRuleIds := WalkSigmaRules(c)
 
-	// build our xml rule file and write it
-	c.Wazuh.XmlRules.Name = "sigma,"
-	c.Wazuh.XmlRules.Header = xml.Comment(`
-	Author: Brian Kellogg
-	Sigma: https://github.com/SigmaHQ/sigma
-	Wazuh: https://wazuh.com
-	All Sigma rules licensed under DRL: https://github.com/SigmaHQ/Detection-Rule-License `)
-	WriteWazuhXmlRules(c)
-
-	// Convert map to json
+	// Persist the Sigma→Wazuh ID map for stable IDs on future runs.
 	jsonData, err := json.Marshal(c.Ids.SigmaToWazuh)
 	if err != nil {
 		LogIt(ERROR, "", err, c.Info, c.Debug)
 	}
-	// Write JSON data to a file
-	err = os.WriteFile(c.Wazuh.RuleIdFile, jsonData, 0644)
-	if err != nil {
+	if err := os.WriteFile(c.Wazuh.RuleIdFile, jsonData, 0644); err != nil {
 		LogIt(ERROR, "", err, c.Info, c.Debug)
 	}
 
@@ -1168,9 +1171,8 @@ const INFO = "info"
 const WARN = "warn"
 const ERROR = "error"
 
-// Get function name for debugging
 func printPreviousFunctionName() string {
-	pc, _, _, _ := runtime.Caller(2) // 2 steps up the call stack
+	pc, _, _, _ := runtime.Caller(2)
 	functionPath := runtime.FuncForPC(pc).Name()
 	return functionPath
 }
@@ -1197,12 +1199,3 @@ func LogIt(level string, msg string, err error, info bool, debug bool) {
 		}
 	}
 }
-
-// func contains(slice []string, str string) bool {
-// 	for _, v := range slice {
-// 		if v == str {
-// 			return true
-// 		}
-// 	}
-// 	return false
-// }
